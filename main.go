@@ -3,15 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/jackpal/gateway"
+	"github.com/mdp/qrterminal/v3" // Updated to v3 version
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"github.com/mdp/qrterminal/v3" // Updated to v3 version
 )
 
 // Use ascii blocks to form the QR Code
@@ -55,22 +56,70 @@ Access Methods:
 	fmt.Print(helpText)
 }
 
-// Get local LAN IP (for mobile QR code access)
-func getLocalIP() string {
-	addrs, err := net.InterfaceAddrs()
+// localIPString adds error return value to expose internal errors to upper layer processing
+// Return values: localIP(string), error
+func localIPString() (string, error) {
+	// Discover the default gateway's IP address
+	gwIP, err := gateway.DiscoverGateway()
 	if err != nil {
-		return "localhost"
+		// No longer directly Fatal, but return error for upper layer processing
+		return "", fmt.Errorf("failed to discover gateway: %w", err)
 	}
 
-	for _, addr := range addrs {
-		// Filter loopback addresses and IPv6 addresses, only take IPv4 LAN addresses
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-			if ipNet.IP.To4() != nil {
-				return ipNet.IP.String()
+	// Find the local IP address associated with the interface that connects to the gateway
+	localIP, err := getLocalIPForGateway(gwIP)
+	if err != nil {
+		return "", fmt.Errorf("failed to find local IP for gateway: %w", err)
+	}
+
+	// Additional validation: prevent returning nil IP
+	if localIP == nil {
+		return "", fmt.Errorf("local IP address is nil")
+	}
+
+	return localIP.String(), nil
+}
+
+// getLocalIPForGateway finds the local IP that is in the same subnet as the gateway IP
+func getLocalIPForGateway(gwIP net.IP) (net.IP, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve network interfaces: %w", err)
+	}
+
+	for _, iface := range interfaces {
+		// Skip disabled network cards
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			// Record warning for single network card address acquisition failure, do not interrupt overall process
+			log.Printf("Warning: failed to get addresses for interface %s: %v", iface.Name, err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			// Only keep IPv4 addresses, and filter loopback/non-global unicast addresses
+			ipv4 := ipnet.IP.To4()
+			if ipv4 == nil || !ipv4.IsGlobalUnicast() || ipv4.IsLoopback() {
+				continue
+			}
+
+			// Check if the gateway is in the subnet of the current network card
+			if ipnet.Contains(gwIP) {
+				return ipv4, nil
 			}
 		}
 	}
-	return "localhost"
+
+	return nil, fmt.Errorf("no local IPv4 address found in the same subnet as gateway %s", gwIP.String())
 }
 
 // Handle HTTP requests for video files (supports Range partial content)
@@ -219,7 +268,11 @@ func main() {
 	http.HandleFunc("/video", videoHandler)
 
 	// Get local LAN IP
-	localIP := getLocalIP()
+	localIP, err := localIPString()
+	if err != nil {
+		fmt.Printf("Failed to get local IP address: %s\n", err.Error())
+		os.Exit(1)
+	}
 	accessURL := fmt.Sprintf("http://%s:%d", localIP, serverPort)
 
 	// Start HTTP service (asynchronous to avoid blocking QR code generation)
